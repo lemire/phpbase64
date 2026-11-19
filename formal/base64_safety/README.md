@@ -1,12 +1,14 @@
-# Store safety of the base64 encoders and decoders
+# Memory safety of the base64 encoders and decoders
 
-This Lean 4 development proves that no store of the base64 code in
-`ext/standard/base64.c` goes past its buffer, on any input. It covers:
+This Lean 4 development proves that no access of the base64 code in
+`ext/standard/base64.c` leaves its buffer, on any input, and that the bounds
+it proves are the best possible. It covers:
 
 - the decoder template `PHP_BASE64_DECODE_SIMD` for SSSE3, AVX2,
   AVX-512 VBMI and NEON, in strict and non-strict mode, including the
   hand-over to the scalar decoder (`php_base64_decode_resume`);
-- every encoder: scalar, NEON, SSSE3, AVX2, AVX-512 and AVX-512 VBMI.
+- every encoder: scalar, NEON, SSSE3, AVX2, AVX-512 and AVX-512 VBMI;
+- stores and loads: the output, the decoder's stack buffers, and the input.
 
 ```sh
 source "$HOME/.elan/env"
@@ -15,25 +17,27 @@ lake build
 ```
 
 `lean-toolchain` pins Lean 4.35. There is no mathlib, no `sorry` and no
-`native_decide`. The theorems use only the axioms `propext`, `Quot.sound` and
-`Classical.choice`.
+`native_decide`; the witnesses use `decide`, checked by the kernel. The
+theorems use only the axioms `propext`, `Quot.sound` and `Classical.choice`.
+About 1300 lines; a clean build takes 3 seconds on an Apple M4 Max.
 
 ## Files
 
 | file | content |
 |---|---|
-| `Base64Safety/Basic.lean` | stores, `php_base64_copy_short`, the scalar decoder (`php_base64_decode_put`) |
-| `Base64Safety/Decode.lean` | the store helpers of each instruction set, the decoder, `decode_ok` |
-| `Base64Safety/Encode.lean` | the encoders and their theorems |
+| `Base64Safety/Basic.lean` | accesses, `php_base64_copy_short`, the scalar decoder (`php_base64_decode_put`) |
+| `Base64Safety/Decode.lean` | the helpers of each instruction set, the decoder, `decode_tight`, `decode_ok` |
+| `Base64Safety/Encode.lean` | the encoders, with their loop tests as parameters, and their theorems |
+| `Base64Safety/Tight.lean` | witnesses: every bound is reached, and every encoder loop test is the least that works |
 
 ## Model
 
-A **store** writes `len` bytes at offset `off` of a buffer: `out` (the
-result's characters), `pending` (the decoder's array of pending values) or
-`last` (the decoder's 64-byte tail). A vector store writes the vector's full
-width, whatever its lanes hold. A masked AVX-512 store writes the bytes its mask
-selects, because masked-out bytes do not fault. A `memcpy` or `memset` of
-`n` bytes is one store of `n` bytes.
+An **access** reads or writes `len` bytes at offset `off` of a buffer: `out`
+(the result's characters), `pending` (the decoder's array of pending values),
+`last` (the decoder's 64-byte tail) or `input`. A vector store writes the
+vector's full width, whatever its lanes hold. A masked AVX-512 load or store
+touches the bytes its mask selects, because the other bytes do not fault. A
+`memcpy` or `memset` of `n` bytes is one access of `n` bytes.
 
 **Buffer sizes.**
 
@@ -43,6 +47,7 @@ selects, because masked-out bytes do not fault. A `memcpy` or `memset` of
 | encoder `out` | `4 * ⌈n / 3⌉ + 1` | `zend_string_safe_alloc((n + 2) / 3, 4, 0, 0)` |
 | `pending` | 640 | `php_base64_<isa>_block pending[512 / 64 + 2]` |
 | `last` | 64 | `unsigned char last[64]` |
+| input | `n` | |
 
 **Decoder input.** The block loops advance by 64 bytes, so they see `⌊n / 64⌋`
 blocks followed by a tail of `t = n % 64` bytes. A block is reduced to the
@@ -54,67 +59,89 @@ boolean that stands for "strict mode, and a byte that is neither alphabet nor
 whitespace", which triggers `php_base64_decode_resume`. The input also leaves
 free how many 16-byte `step16` decodes the tail gets, and how many alphabet
 characters the scalar loop sees. Each is capped only by the bytes the code
-reads. The theorems hold for every choice.
-
-A failing run (`goto fail`, or `php_base64_decode_loop` returning 0) only stops
-writing. Its stores are a prefix of the stores of a run that does not fail, so
-the model covers it.
+reads. The theorems hold for every choice. A failing run (`goto fail`, or
+`php_base64_decode_loop` returning 0) only stops early, so its accesses are a
+prefix of those of a run that does not fail.
 
 **Helpers** (`Isa`), relative to their destination pointer:
 
-| | `pack` | `compress` | `step16` |
-|---|---|---|---|
-| SSSE3 | 16 at 0, 12, 24, 36 | 16 at 0, `q0`, `q0+q1`, `q0+q1+q2` (single bad byte: at `16i - (j < i)`) | 16 |
-| AVX2 | 32 at 0, 24 | per half: 32, or 16 at 0 and 16 at `q`; single bad byte as SSSE3 | 16 |
-| AVX-512 VBMI | 64 | 64 | 16 |
-| NEON | 48 (`vst3q_u8`) | as SSSE3 | 16 |
+| | `pack` | `compress` | `step16` | slack |
+|---|---|---|---|---|
+| SSSE3 | 16 at 0, 12, 24, 36 | 16 at 0, `q0`, `q0+q1`, `q0+q1+q2` (single bad byte: at `16i - (j < i)`) | 16 | 4 |
+| AVX2 | 32 at 0, 24 | per half: 32, or 16 at 0 and 16 at `q`; single bad byte as SSSE3 | 16 | 8 |
+| AVX-512 VBMI | 64 | 64 | 16 | 16 |
+| NEON | 48 (`vst3q_u8`) | as SSSE3 | 16 | 4 |
 
-`Isa.Good` requires each helper to stay within 64 bytes of its pointer (16 for
-`step16`), and the four instruction sets are proved to satisfy it.
+The slack is how far `pack` writes past the 48 bytes it decodes, or 4 (the
+overhang of `step16`), whichever is larger.
 
 ## Theorems
 
-- `decode_ok`: for any `Isa.Good` instruction set and any input, every store of
-  the decoder stays inside `out`, `pending` and `last`.
-  `decode_ssse3_ok`, `decode_avx2_ok`, `decode_avx512vbmi_ok` and
-  `decode_neon_ok` apply it to each instruction set.
+- `decode_tight`: every access of the decoder ends within
+  `min(n + 1, ⌊3n/4⌋ + slack)` bytes of `out`, 638 bytes of `pending`, 64 of
+  `last` and the `n` bytes of the input. `decode_ok` restates it with the
+  buffer sizes, and `decode_ssse3_ok`, `decode_avx2_ok`,
+  `decode_avx512vbmi_ok` and `decode_neon_ok` apply it to each instruction set.
 - `encScalar_ok`, `encNeon_ok`, `encSsse3_ok`, `encAvx2_ok`, `encAvx512_ok`,
-  `encVbmi_ok`: the same for each encoder, with or without padding.
+  `encVbmi_ok`: the same for each encoder, with or without padding. The
+  `...G_ok` versions take the loop test as a parameter.
 - `vbmi_lengths`: in the VBMI encoder tail, `2 ≤ data_len ≤ out_len ≤ 64`, so
   the shifts `UINT64_MAX >> (64 - x)` are defined.
+- `wloop_out`: the stores of the encoders' vector loops are exact, so they
+  would stay in the buffer with no margin at all.
 
-**Invariants.** In the decoder's block loops, let `o` be the bytes written to
-`out`, `c` the bytes read and `buf` the pending values. Then `o + buf ≤ c` and
-`buf < 512`. A block adds at most 64 to `o + buf`, and turning 64 pending
-values into 48 bytes lowers it by 16. A store of at most 64 bytes at `o`,
-issued while a whole block is still unread, therefore ends by `c + 64 ≤ n`.
-This is the argument in the comment above `php_base64_ws_set`. In the scalar
-decoder, the `i`-th alphabet character is stored below `j0 + i + 1`. In the
-encoders, `3 * o + 4 * len = 4 * n`, and every vector store of `w` bytes runs
-with at least `3 * w / 4` bytes left.
+**Invariants.** In the decoder, let `o` be the bytes written to `out`, `c`
+the bytes read and `buf` the pending values. Then `4 * o + 3 * buf ≤ 3 * c`
+and `buf < 512`. Four 6-bit values make three bytes: a block of 64 bytes adds
+at most 192 to each side, and decoding 64 pending values into 48 bytes leaves
+the left side unchanged. A store of `48 + slack` bytes at `o`, issued while a
+whole block is still unread, therefore ends by `3(n - 64)/4 + 48 + slack`. In
+the scalar decoder, the `i`-th alphabet character is stored below
+`j0 + i + 1` and below `j0 + (3(i + 1) + 3) / 4`. In the encoders,
+`3 * o = 4 * c`.
 
-## Margins
+## Tightness (`Tight.lean`)
 
-The proofs leave little slack, so each bound is checked against the model:
+Every bound is reached, so none can be lowered:
 
-- `pending`: the stores end at most at byte 638 of 640. A 575-byte input
-  reaches 638: one block with 63 alphabet characters, seven clean blocks, then
-  a tail of 63 alphabet characters. That leaves 511 pending values, the last
-  compress writes up to byte 575, and the `memset` writes up to byte 638. With
-  a 637-byte array the proof fails.
-- Mutants that the proofs reject: a 65-byte NEON `pack`, the AVX2 second
-  16-byte store one byte later, `step16` advancing `o` by 13, the `put` case 1
-  store at `j + 2`, the AVX2 encoder breaking at `length < 20` instead of 28,
-  the SSSE3 encoder loop running at 15 bytes left, and the VBMI tail with
-  `(len + 3) / 3` groups.
+| bound | witness |
+|---|---|
+| `pending`: 638 of 640 bytes, all instruction sets | 575 bytes: one block with a byte outside the alphabet, seven clean blocks, then 63 alphabet characters. That leaves 511 pending values, the last `compress` writes up to byte 575, and the `memset` up to byte 638. Nine blocks (576 bytes) would overflow. |
+| `out`: `⌊3n/4⌋ + 4` (SSSE3, NEON) | 16 alphabet characters: `step16` writes 16 bytes, which is also all of `n` |
+| `out`: `⌊3n/4⌋ + 8` (AVX2), `+ 16` (VBMI), `+ 4` via `pack` (SSSE3) | 64 alphabet characters: `pack` writes up to byte 56, 64 (all of `n`) and 52 |
+
+Each loop of the decoder tests for exactly the bytes it loads: 64 per block,
+128 per pair, 16 per step. Its margin is zero, and the stores fit.
+
+The encoders' vector stores are exact (`wloop_out`), so the loads set the loop
+tests. Each test is the least that keeps the loads in the input: with one
+less, some input makes a load read past its end.
+
+| loop | test | consumed | margin | witness of one less |
+|---|---|---|---|---|
+| SSSE3 | `length > 15` | 12 | 4 | `ssse3_tight`: 15 bytes, 16-byte load |
+| AVX2, first | `length > 31` | 24 | 8 | `avx2_first_tight`: 31 bytes, 32-byte load |
+| AVX2, loop | `length >= 28` | 24 | 4 | `avx2_loop_tight`: 51 bytes, the load at `c - 4` ends at byte 52 |
+| AVX-512 | `length > 63` | 48 | 16 | `avx512_tight`: 63 bytes, 64-byte load |
+| VBMI, loop | `length >= 64` | 48 | 16 | `vbmi_tight`: 63 bytes, 64-byte load |
+| VBMI, masked step | `length >= 48` | 48 | 0 | `vbmi_masked_tight`: 47 bytes, 48-byte masked load |
+| NEON | `inl >= 48` | 48 | 0 | `neon_tight`: 47 bytes, `vld3q_u8` of 48 |
+
+**What the bounds say about the code.** The decoder allocates `n + 1` bytes,
+but it never writes past `⌊3n/4⌋ + 16` (`+ 4` with NEON), so it could allocate
+about a quarter less. The AVX-512 encoder could drop its margin of 16 by using
+the masked step of the VBMI encoder.
 
 ## What is assumed
 
 - The model is a hand transcription of the C code: the control flow of
   `PHP_BASE64_DECODE_SIMD` and of the encoders, and the offset and width of
-  each store in the helpers. Comments in the Lean files quote the C they model.
-- The store width of each intrinsic, and masked AVX-512 stores writing only
-  the bytes their mask selects.
-- Loads are not modelled: this development is about writes only.
+  each access in the helpers. Comments in the Lean files quote the C they
+  model.
+- The width of each intrinsic's access, and masked AVX-512 accesses touching
+  only the bytes their mask selects.
+- Lookup-table reads (`php_base64_thintable`, `php_base64_combine[kept]` with
+  `kept ≤ 8`, `base64_reverse_table`) are indexed by a byte or a count and are
+  not modelled.
 - Lengths are natural numbers. `size_t` overflow is not modelled; allocation
   fails before it matters.

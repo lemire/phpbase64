@@ -1,10 +1,10 @@
-# Vectorized base64 for PHP, with a Lean 4 proof of its store bounds
+# Vectorized base64 for PHP, with a Lean 4 proof of its memory safety
 
 This repository holds the code of the php-src pull request
 [php/php-src#25476](https://github.com/php/php-src/pull/25476), which ports the
 simdutf base64 decoders (SSSE3, AVX2, AVX-512 VBMI, NEON) to
 `ext/standard/base64.c`, and a Lean 4 proof that the encoders and decoders
-never write outside their buffers.
+never read or write outside their buffers, with bounds shown to be tight.
 
 | path | content |
 |---|---|

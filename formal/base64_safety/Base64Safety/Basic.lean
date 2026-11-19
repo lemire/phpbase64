@@ -1,11 +1,14 @@
 /-
 The store model shared by the decoder and the encoder.
 
-A store writes `len` consecutive bytes at offset `off` of a buffer. A vector
-store (`_mm_storeu_si128`, `vst1q_u8`, `vst3q_u8`, ...) is one store of the
+An access reads or writes `len` consecutive bytes at offset `off` of a
+buffer. Loads are the accesses to `input` and the reads of `pending` and
+`last`; the model does not need to tell them apart from stores, since the
+bound is the same. A vector store (`_mm_storeu_si128`, `vst1q_u8`, `vst3q_u8`, ...) is one store of the
 vector's width, whatever its lanes hold; a masked AVX-512 store is a store of
 the bytes its mask selects, and a `memcpy` or `memset` of `n` bytes is a store
-of `n` bytes. A store is in bounds when it ends at or before the buffer size.
+of `n` bytes. A masked AVX-512 load reads the bytes its mask selects. An
+access is in bounds when it ends at or before the buffer size.
 -/
 
 namespace Base64Safety
@@ -18,6 +21,8 @@ inductive Buf where
   | pending
   /-- The decoder's stack array `last[64]`. -/
   | last
+  /-- The input string, which is only read. -/
+  | input
 deriving DecidableEq, Repr
 
 structure Store where
@@ -46,6 +51,17 @@ theorem AllOk.single {cap : Buf → Nat} {b : Buf} {off len : Nat}
   simp at hs
   subst hs
   exact h
+
+theorem AllOk.mono {cap cap' : Buf → Nat} {l : List Store} (h : AllOk cap l)
+    (hc : ∀ b, cap b ≤ cap' b) : AllOk cap' l :=
+  fun s hs => Nat.le_trans (h s hs) (hc s.buf)
+
+theorem AllOk.cons {cap : Buf → Nat} {s : Store} {l : List Store}
+    (h : s.off + s.len ≤ cap s.buf) (hl : AllOk cap l) : AllOk cap (s :: l) := by
+  intro x hx
+  rcases List.mem_cons.mp hx with rfl | hx
+  · exact h
+  · exact hl x hx
 
 /-- The stores of a helper, given as (offset, width) pairs relative to its
 destination pointer `base`. -/
@@ -121,48 +137,66 @@ def scalar (j i : Nat) : Nat → List Store × Nat
 /-- The value of `j` before character `i`, when it was `j0` before character 0. -/
 def jOf (j0 i : Nat) : Nat := j0 + 3 * (i / 4) + (i % 4 - 1)
 
-theorem put_spec (cap : Buf → Nat) (j0 i : Nat) (h : j0 + i + 1 ≤ cap .out) :
-    AllOk cap (put (jOf j0 i) i).1 ∧ (put (jOf j0 i) i).2 = jOf j0 (i + 1) := by
-  unfold put jOf
+/-- Every store of `put` at character `i`, with `j` in step, writes `out` and
+ends at most at `j0 + i + 1`, and within `(3 * (i + 1) + 3) / 4` of `j0`. -/
+def PutBound (j0 i : Nat) (s : Store) : Prop :=
+  s.buf = .out ∧ s.off + s.len ≤ j0 + i + 1 ∧ 4 * (s.off + s.len) ≤ 4 * j0 + 3 * (i + 1) + 3
+
+theorem put_spec (j0 i : Nat) :
+    (∀ s ∈ (put (jOf j0 i) i).1, PutBound j0 i s) ∧ (put (jOf j0 i) i).2 = jOf j0 (i + 1) := by
+  unfold put jOf PutBound
   have h4 : i % 4 < 4 := Nat.mod_lt _ (by decide)
   have hd : i = 4 * (i / 4) + i % 4 := (Nat.div_add_mod i 4).symm
   have hd' : i + 1 = 4 * ((i + 1) / 4) + (i + 1) % 4 := (Nat.div_add_mod (i + 1) 4).symm
   split
-  · refine ⟨AllOk.single (by omega), by omega⟩
+  · refine ⟨?_, by omega⟩
+    intro s hs
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hs
+    subst hs; exact ⟨rfl, by simp only; omega, by simp only; omega⟩
   · split
     · refine ⟨?_, by omega⟩
       intro s hs
       simp only [List.mem_cons, List.not_mem_nil, or_false] at hs
-      rcases hs with rfl | rfl <;> simp only <;> omega
+      rcases hs with rfl | rfl <;> exact ⟨rfl, by simp only; omega, by simp only; omega⟩
     · split
       · refine ⟨?_, by omega⟩
         intro s hs
         simp only [List.mem_cons, List.not_mem_nil, or_false] at hs
-        rcases hs with rfl | rfl <;> simp only <;> omega
-      · refine ⟨AllOk.single (by omega), by omega⟩
+        rcases hs with rfl | rfl <;> exact ⟨rfl, by simp only; omega, by simp only; omega⟩
+      · refine ⟨?_, by omega⟩
+        intro s hs
+        simp only [List.mem_cons, List.not_mem_nil, or_false] at hs
+        subst hs; exact ⟨rfl, by simp only; omega, by simp only; omega⟩
 
-/-- The scalar decoder, from character `i` on, stores below `j0 + i + m`, where
-`j0` is the value of `j` before character 0, and ends with `j` in step. -/
-theorem scalar_spec (cap : Buf → Nat) (j0 : Nat) :
-    ∀ m i, j0 + i + m ≤ cap .out →
-      AllOk cap (scalar (jOf j0 i) i m).1 ∧ (scalar (jOf j0 i) i m).2 = jOf j0 (i + m) := by
+/-- The scalar decoder, from character `i` on, writes only `out`, ends below
+`j0 + i + m` and below `3/4` of the characters plus 3/4, where `j0` is the value
+of `j` before character 0, and ends with `j` in step. -/
+theorem scalar_spec (j0 : Nat) : ∀ m i,
+    (∀ s ∈ (scalar (jOf j0 i) i m).1,
+      s.buf = .out ∧ s.off + s.len ≤ j0 + i + m ∧ 4 * (s.off + s.len) ≤ 4 * j0 + 3 * (i + m) + 3) ∧
+    (scalar (jOf j0 i) i m).2 = jOf j0 (i + m) := by
   intro m
   induction m with
-  | zero => intro i _; exact ⟨AllOk.nil cap, rfl⟩
+  | zero => intro i; exact ⟨by simp [scalar], rfl⟩
   | succ m ih =>
-    intro i h
-    obtain ⟨hp, hj⟩ := put_spec cap j0 i (by omega)
+    intro i
+    obtain ⟨hp, hj⟩ := put_spec j0 i
     simp only [scalar]
     rw [hj]
-    obtain ⟨hs, hj'⟩ := ih (i + 1) (by omega)
-    refine ⟨AllOk.append hp hs, ?_⟩
-    rw [hj']
-    congr 1
-    omega
+    obtain ⟨hs, hj'⟩ := ih (i + 1)
+    refine ⟨?_, ?_⟩
+    · intro s hs'
+      rcases List.mem_append.mp hs' with h | h
+      · obtain ⟨h1, h2, h3⟩ := hp s h
+        exact ⟨h1, by omega, by omega⟩
+      · obtain ⟨h1, h2, h3⟩ := hs s h
+        exact ⟨h1, by omega, by omega⟩
+    · rw [hj']; congr 1; omega
 
-theorem jOf_le (j0 i : Nat) : jOf j0 i ≤ j0 + i := by
+theorem jOf_le (j0 i : Nat) : jOf j0 i ≤ j0 + i ∧ 4 * jOf j0 i ≤ 4 * j0 + 3 * i := by
   unfold jOf
   have := Nat.div_add_mod i 4
+  have : i % 4 < 4 := Nat.mod_lt _ (by decide)
   omega
 
 theorem jOf_zero (j0 : Nat) : jOf j0 0 = j0 := by
